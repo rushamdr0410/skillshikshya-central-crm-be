@@ -2,6 +2,10 @@ from django.contrib.auth import get_user_model
 from rest_framework import status
 from rest_framework.test import APITestCase
 
+from datetime import datetime
+from zoneinfo import ZoneInfo
+NPT = ZoneInfo("Asia/Kathmandu")
+
 from apps.course.models import Course
 from apps.lead.models import Lead
 
@@ -196,3 +200,86 @@ class GlobalCallListTests(APITestCase):
         self.client.force_authenticate(other_admin)
         response = self.client.get('/api/calls/')
         self.assertNotIn(self.recent_call.id, [r['id'] for r in response.data['results']])
+
+class CallDateFilterTests(APITestCase):
+    """date_from / date_to filters use Nepal-time day boundaries."""
+
+    def setUp(self):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        from apps.branch.models import Branch
+        from apps.lead.models import LeadCall
+
+        npt = ZoneInfo("Asia/Kathmandu")
+
+        self.admin = User.objects.create_user(
+            email='datefilter@test.com', name='Date Admin',
+            password='pass', is_staff=True,
+        )
+        self.client.force_authenticate(self.admin)
+        self.branch = Branch.objects.create(name='Kathmandu', code='KTM')
+        self.lead = Lead.objects.create(
+            full_name='Date Person', phone='9800000000',
+        )
+
+        def make_call(ts):
+            return LeadCall.objects.create(
+                lead=self.lead, call_timestamp=ts, direction='outbound',
+                caller='Date Admin', phone_number='9800000000',
+                duration_seconds=60, created_by=self.admin,
+                branch=self.branch,
+            )
+
+        self.first_second = make_call(datetime(2026, 11, 23, 0, 0, 0, tzinfo=npt))
+        self.midday = make_call(datetime(2026, 11, 23, 12, 0, 0, tzinfo=npt))
+        self.last_second = make_call(
+            datetime(2026, 11, 23, 23, 59, 59, 999999, tzinfo=npt)
+        )
+        self.day_before = make_call(
+            datetime(2026, 11, 22, 23, 59, 59, tzinfo=npt)
+        )
+        self.next_day = make_call(datetime(2026, 11, 24, 0, 0, 0, tzinfo=npt))
+
+    def _ids(self, response):
+        return {row['id'] for row in response.data['results']}
+
+    def test_single_day_includes_both_edges_and_excludes_neighbours(self):
+        response = self.client.get(
+            '/api/calls/?date_from=2026-11-23&date_to=2026-11-23'
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            self._ids(response),
+            {self.first_second.id, self.midday.id, self.last_second.id},
+        )
+        self.assertEqual(response.data['count'], 3)
+
+    def test_date_from_only(self):
+        response = self.client.get('/api/calls/?date_from=2026-11-23')
+        self.assertEqual(
+            self._ids(response),
+            {self.first_second.id, self.midday.id,
+             self.last_second.id, self.next_day.id},
+        )
+
+    def test_date_to_only(self):
+        response = self.client.get('/api/calls/?date_to=2026-11-23')
+        self.assertEqual(
+            self._ids(response),
+            {self.day_before.id, self.first_second.id,
+             self.midday.id, self.last_second.id},
+        )
+
+    def test_multi_day_range(self):
+        response = self.client.get(
+            '/api/calls/?date_from=2026-11-23&date_to=2026-11-24'
+        )
+        self.assertEqual(
+            self._ids(response),
+            {self.first_second.id, self.midday.id,
+             self.last_second.id, self.next_day.id},
+        )
+
+    def test_no_params_returns_everything(self):
+        response = self.client.get('/api/calls/')
+        self.assertEqual(response.data['count'], 5)
