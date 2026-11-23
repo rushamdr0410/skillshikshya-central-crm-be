@@ -43,6 +43,10 @@ from apps.global_config.pagination import CustomPagination
 from apps.global_config.permissions import IsStaffOrHasPermission
 from apps.global_config.filters import BranchFilterBackend
 
+from django.db.models import Count, Sum, Avg, Q
+from django.db.models.functions import TruncDate
+from .filters import GlobalCallFilter, NPT 
+
 
 class ConfigViewSet(viewsets.ModelViewSet):
     pagination_class = CustomPagination
@@ -237,6 +241,52 @@ class GlobalFollowUpViewSet(viewsets.ReadOnlyModelViewSet):
             return [IsAuthenticated()]
         return [IsAuthenticated(), IsStaffOrHasPermission()]
 
+    def get_permissions(self):
+        if self.action in ['list', 'retrieve', 'summary', 'export']:
+            return [IsAuthenticated()]
+        return [IsAuthenticated(), IsStaffOrHasPermission()]
+
+    @action(detail=False, methods=['get'], url_path='summary')
+    def summary(self, request):
+        qs = self.filter_queryset(self.get_queryset()).order_by()
+
+        totals = qs.aggregate(
+            total=Count('id'),
+            inbound=Count('id', filter=Q(direction='inbound')),
+            talk_seconds=Sum('duration_seconds'),
+            connected=Count('id', filter=Q(duration_seconds__gt=0)),
+        )
+        total = totals['total']
+        talk = totals['talk_seconds'] or 0          # Sum is None when empty
+
+        per_day = (
+            qs.annotate(day=TruncDate('call_timestamp', tzinfo=NPT))
+            .values('day')
+            .annotate(count=Count('id'))
+            .order_by('day')
+        )
+
+        top_callers = (
+            qs.filter(created_by__isnull=False)
+            .values('created_by', 'created_by__name')
+            .annotate(count=Count('id'))
+            .order_by('-count', 'created_by__name')[:10]
+        )
+
+        return Response({
+            'total_calls': total,
+            'inbound': totals['inbound'],
+            'outbound': total - totals['inbound'],
+            'talk_seconds': talk,
+            'avg_seconds': round(talk / total) if total else 0,
+            'connect_rate': round(totals['connected'] * 100 / total, 1) if total else 0,
+            'per_day': [{'date': r['day'].isoformat(), 'count': r['count']} for r in per_day],
+            'top_callers': [
+                {'user_id': r['created_by'], 'name': r['created_by__name'], 'count': r['count']}
+                for r in top_callers
+            ],
+        })
+
 
 class GlobalEnrollmentViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = Enrollment.objects.none()
@@ -301,6 +351,46 @@ class GlobalCallViewSet(viewsets.ReadOnlyModelViewSet):
         if self.action in ['list', 'retrieve']:
             return [IsAuthenticated()]
         return [IsAuthenticated(), IsStaffOrHasPermission()]
+
+    @action(detail=False, methods=['get'], url_path='summary')
+    def summary(self, request):
+        qs = self.filter_queryset(self.get_queryset()).order_by()
+
+        totals = qs.aggregate(
+            total=Count('id'),
+            inbound=Count('id', filter=Q(direction='inbound')),
+            talk_seconds=Sum('duration_seconds'),
+            connected=Count('id', filter=Q(duration_seconds__gt=0)),
+        )
+        total = totals['total']
+        talk = totals['talk_seconds'] or 0
+
+        per_day = (
+            qs.annotate(day=TruncDate('call_timestamp', tzinfo=NPT))
+            .values('day')
+            .annotate(count=Count('id'))
+            .order_by('day')
+        )
+        top_callers = (
+            qs.filter(created_by__isnull=False)
+            .values('created_by', 'created_by__name')
+            .annotate(count=Count('id'))
+            .order_by('-count', 'created_by__name')[:10]
+        )
+
+        return Response({
+            'total_calls': total,
+            'inbound': totals['inbound'],
+            'outbound': total - totals['inbound'],
+            'talk_seconds': talk,
+            'avg_seconds': round(talk / total) if total else 0,
+            'connect_rate': round(totals['connected'] * 100 / total, 1) if total else 0,
+            'per_day': [{'date': r['day'].isoformat(), 'count': r['count']} for r in per_day],
+            'top_callers': [
+                {'user_id': r['created_by'], 'name': r['created_by__name'], 'count': r['count']}
+                for r in top_callers
+            ],
+        })
 
 
 class NotificationViewSet(viewsets.ModelViewSet):
