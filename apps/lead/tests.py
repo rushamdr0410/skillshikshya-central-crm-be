@@ -1,3 +1,6 @@
+import csv
+import io
+
 from django.contrib.auth import get_user_model
 from rest_framework import status
 from rest_framework.test import APITestCase
@@ -151,6 +154,13 @@ class GlobalCallListTests(APITestCase):
             created_by=self.admin, branch=self.branch,
         )
 
+    def _export(self, query=''):                      
+        response = self.client.get(f'/api/calls/export/{query}')
+        self.assertEqual(response.status_code, 200)
+        raw = b''.join(response.streaming_content)
+        rows = list(csv.reader(io.StringIO(raw.decode('utf-8-sig'))))
+        return response, raw, rows
+
     def test_list_returns_all_calls_newest_first(self):
         response = self.client.get('/api/calls/')
         self.assertEqual(response.status_code, 200)
@@ -200,6 +210,62 @@ class GlobalCallListTests(APITestCase):
         self.client.force_authenticate(other_admin)
         response = self.client.get('/api/calls/')
         self.assertNotIn(self.recent_call.id, [r['id'] for r in response.data['results']])
+
+    def test_export_headers_and_row_count(self):
+        response, raw, rows = self._export()
+        self.assertTrue(response['Content-Type'].startswith('text/csv'))
+        self.assertIn('calls-', response['Content-Disposition'])
+        self.assertTrue(raw.startswith(b'\xef\xbb\xbf'))        
+        self.assertEqual(rows[0], [
+            'Date & time (NPT)', 'Direction', 'Lead', 'Reference', 'Phone',
+            'Caller', 'Logged by', 'Duration (MM:SS)', 'Seconds',
+            'Outcome', 'Notes', 'Recording',
+        ])
+        self.assertEqual(len(rows) - 1, 2)                      
+
+    def test_export_respects_filters(self):
+        _, _, rows = self._export('?direction=inbound')
+        self.assertEqual(len(rows) - 1, 1)
+        self.assertEqual(rows[1][1], 'inbound')
+
+    def test_export_neutralises_formula_in_notes(self):
+        from apps.lead.models import LeadCall
+        from django.utils import timezone as tz
+        LeadCall.objects.create(
+            lead=self.lead, call_timestamp=tz.now(), direction='outbound',
+            caller='X', phone_number='9833333333', duration_seconds=5,
+            notes='=HYPERLINK("http://evil","click")',
+            created_by=self.admin, branch=self.branch,
+        )
+        _, _, rows = self._export()
+        notes = [r[10] for r in rows[1:]]
+        self.assertIn('\'=HYPERLINK("http://evil","click")', notes)
+
+    def test_export_duration_columns(self):
+        _, _, rows = self._export()
+        by_seconds = {r[8]: r[7] for r in rows[1:]}
+        self.assertEqual(by_seconds['270'], '04:30')
+        self.assertEqual(by_seconds['60'], '01:00')
+
+    def test_export_query_count_is_constant(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+        from apps.lead.models import LeadCall
+        from django.utils import timezone as tz
+
+        with CaptureQueriesContext(connection) as small:
+            self._export()
+
+        for i in range(25):
+            LeadCall.objects.create(
+                lead=self.lead, call_timestamp=tz.now(), direction='outbound',
+                caller='Bulk', phone_number=f'98000000{i:02d}', duration_seconds=i,
+                created_by=self.counselor, branch=self.branch,
+            )
+        with CaptureQueriesContext(connection) as large:
+            self._export()
+
+        self.assertEqual(len(small), len(large))
 
 class CallDateFilterTests(APITestCase):
     """date_from / date_to filters use Nepal-time day boundaries."""

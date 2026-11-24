@@ -45,7 +45,7 @@ from apps.global_config.permissions import IsStaffOrHasPermission
 from apps.global_config.filters import BranchFilterBackend
 
 from django.db.models import Count, Sum, Avg, Q
-from django.db.models.functions import TruncDate
+from django.db.models.functions import TruncDate, Coalesce
 from apps.callminutes.utils import format_duration
 from .filters import GlobalCallFilter, NPT 
 
@@ -802,3 +802,4 @@ class LeadDocumentViewSet(viewsets.ModelViewSet):
         else:
             permission_classes = [IsAuthenticated]
         return [p() for p in permission_classes]
+    
