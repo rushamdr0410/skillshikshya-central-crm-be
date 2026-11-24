@@ -44,10 +44,10 @@ from apps.global_config.pagination import CustomPagination
 from apps.global_config.permissions import IsStaffOrHasPermission
 from apps.global_config.filters import BranchFilterBackend
 
-from django.db.models import Count, Sum, Avg, Q
+from django.db.models import Count, Sum, Q
 from django.db.models.functions import TruncDate, Coalesce
 from apps.callminutes.utils import format_duration
-from .filters import GlobalCallFilter, NPT 
+from .filters import NPT
 
 
 class ConfigViewSet(viewsets.ModelViewSet):
@@ -238,56 +238,10 @@ class GlobalFollowUpViewSet(viewsets.ReadOnlyModelViewSet):
             'lead', 'assigned_to', 'branch',
         )
 
-    def get_permissions(self):
+    def get_permissions(self):                      
         if self.action in ['list', 'retrieve']:
             return [IsAuthenticated()]
         return [IsAuthenticated(), IsStaffOrHasPermission()]
-
-    def get_permissions(self):
-        if self.action in ['list', 'retrieve', 'summary', 'export']:
-            return [IsAuthenticated()]
-        return [IsAuthenticated(), IsStaffOrHasPermission()]
-
-    @action(detail=False, methods=['get'], url_path='summary')
-    def summary(self, request):
-        qs = self.filter_queryset(self.get_queryset()).order_by()
-
-        totals = qs.aggregate(
-            total=Count('id'),
-            inbound=Count('id', filter=Q(direction='inbound')),
-            talk_seconds=Sum('duration_seconds'),
-            connected=Count('id', filter=Q(duration_seconds__gt=0)),
-        )
-        total = totals['total']
-        talk = totals['talk_seconds'] or 0          # Sum is None when empty
-
-        per_day = (
-            qs.annotate(day=TruncDate('call_timestamp', tzinfo=NPT))
-            .values('day')
-            .annotate(count=Count('id'))
-            .order_by('day')
-        )
-
-        top_callers = (
-            qs.filter(created_by__isnull=False)
-            .values('created_by', 'created_by__name')
-            .annotate(count=Count('id'))
-            .order_by('-count', 'created_by__name')[:10]
-        )
-
-        return Response({
-            'total_calls': total,
-            'inbound': totals['inbound'],
-            'outbound': total - totals['inbound'],
-            'talk_seconds': talk,
-            'avg_seconds': round(talk / total) if total else 0,
-            'connect_rate': round(totals['connected'] * 100 / total, 1) if total else 0,
-            'per_day': [{'date': r['day'].isoformat(), 'count': r['count']} for r in per_day],
-            'top_callers': [
-                {'user_id': r['created_by'], 'name': r['created_by__name'], 'count': r['count']}
-                for r in top_callers
-            ],
-        })
 
 
 class GlobalEnrollmentViewSet(viewsets.ReadOnlyModelViewSet):
@@ -365,7 +319,7 @@ class GlobalCallViewSet(viewsets.ReadOnlyModelViewSet):
         )
 
     def get_permissions(self):
-        if self.action in ['list', 'retrieve']:
+        if self.action in ['list', 'retrieve', 'summary', 'export']:
             return [IsAuthenticated()]
         return [IsAuthenticated(), IsStaffOrHasPermission()]
 
@@ -373,39 +327,45 @@ class GlobalCallViewSet(viewsets.ReadOnlyModelViewSet):
     def summary(self, request):
         qs = self.filter_queryset(self.get_queryset()).order_by()
 
-        totals = qs.aggregate(
-            total=Count('id'),
+        t = qs.aggregate(
+            total_calls=Count('id'),
             inbound=Count('id', filter=Q(direction='inbound')),
-            talk_seconds=Sum('duration_seconds'),
-            connected=Count('id', filter=Q(duration_seconds__gt=0)),
+            outbound=Count('id', filter=Q(direction='outbound')),
+            total_seconds=Coalesce(Sum('duration_seconds'), 0),
+            connected_calls=Count('id', filter=Q(duration_seconds__gt=0)),
         )
-        total = totals['total']
-        talk = totals['talk_seconds'] or 0
+        total = t['total_calls']
 
-        per_day = (
+        by_day = (
             qs.annotate(day=TruncDate('call_timestamp', tzinfo=NPT))
             .values('day')
-            .annotate(count=Count('id'))
+            .annotate(calls=Count('id'), seconds=Coalesce(Sum('duration_seconds'), 0))
             .order_by('day')
         )
-        top_callers = (
-            qs.filter(created_by__isnull=False)
-            .values('created_by', 'created_by__name')
-            .annotate(count=Count('id'))
-            .order_by('-count', 'created_by__name')[:10]
+        by_user = (
+            qs.values('created_by', 'created_by__name')
+            .annotate(calls=Count('id'), seconds=Coalesce(Sum('duration_seconds'), 0))
+            .order_by('-calls', 'created_by__name')[:10]
         )
 
+        s = t['total_seconds']
         return Response({
-            'total_calls': total,
-            'inbound': totals['inbound'],
-            'outbound': total - totals['inbound'],
-            'talk_seconds': talk,
-            'avg_seconds': round(talk / total) if total else 0,
-            'connect_rate': round(totals['connected'] * 100 / total, 1) if total else 0,
-            'per_day': [{'date': r['day'].isoformat(), 'count': r['count']} for r in per_day],
-            'top_callers': [
-                {'user_id': r['created_by'], 'name': r['created_by__name'], 'count': r['count']}
-                for r in top_callers
+            **t,
+            'total_formatted': f"{s // 3600:02d}:{s % 3600 // 60:02d}:{s % 60:02d}",
+            'avg_seconds': round(s / total) if total else 0,
+            'connect_rate': round(t['connected_calls'] / total, 3) if total else 0,
+            'by_day': [
+                {'date': r['day'].isoformat(), 'calls': r['calls'], 'seconds': r['seconds']}
+                for r in by_day
+            ],
+            'by_user': [
+                {
+                    'user_id': r['created_by'],
+                    'name': r['created_by__name'] or 'Unknown',
+                    'calls': r['calls'],
+                    'seconds': r['seconds'],
+                }
+                for r in by_user
             ],
         })
 
@@ -802,4 +762,5 @@ class LeadDocumentViewSet(viewsets.ModelViewSet):
         else:
             permission_classes = [IsAuthenticated]
         return [p() for p in permission_classes]
+    
     

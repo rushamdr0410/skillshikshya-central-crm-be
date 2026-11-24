@@ -267,6 +267,26 @@ class GlobalCallListTests(APITestCase):
 
         self.assertEqual(len(small), len(large))
 
+    def test_zz_nonstaff_without_branch_experiment(self):
+        from apps.lead.models import LeadCall
+        from django.utils import timezone as tz
+        LeadCall.objects.create(          # a call with NO branch
+            lead=self.lead, call_timestamp=tz.now(), direction='inbound',
+            caller='NoBranch', phone_number='9866666666', duration_seconds=10,
+            created_by=self.admin, branch=None,
+        )
+        nobranch = User.objects.create_user(email='nb@test.com', name='No Branch', password='x')
+        self.client.force_authenticate(nobranch)
+        print('\nLIST COUNT:', self.client.get('/api/calls/').data['count'])
+        print('SUMMARY TOTAL:', self.client.get('/api/calls/summary/').data['total_calls'])
+        _, _, rows = self._export()
+        print('EXPORT ROWS:', len(rows) - 1)
+        print('TOTAL CALLS IN DB:', LeadCall.objects.count())
+
+    def test_list_includes_duration_formatted(self):
+        row = self.client.get('/api/calls/').data['results'][0]
+        self.assertEqual(row['duration_formatted'], '04:30')  
+
 class CallDateFilterTests(APITestCase):
     """date_from / date_to filters use Nepal-time day boundaries."""
 
@@ -454,3 +474,91 @@ class GlobalCallSummaryTests(APITestCase):
             with self.assertNumQueries(baseline):
                 response = self.client.get('/api/calls/summary/')
             self.assertEqual(response.data['total_calls'], 25)
+
+class GlobalCallSummaryTests(APITestCase):
+    def setUp(self):
+        from datetime import datetime, timezone as dt_tz
+        from apps.branch.models import Branch
+        from apps.lead.models import LeadCall
+
+        self.admin = User.objects.create_user(
+            email='sum-admin@test.com', name='Sum Admin', password='pass', is_staff=True,
+        )
+        self.client.force_authenticate(self.admin)
+        self.branch = Branch.objects.create(name='Biratnagar', code='BRT')
+        self.lead = Lead.objects.create(full_name='Summary Person', phone='9855555555')
+
+        def mk(ts, direction, secs, user):
+            return LeadCall.objects.create(
+                lead=self.lead, call_timestamp=ts, direction=direction,
+                caller='x', phone_number='9855555555', duration_seconds=secs,
+                created_by=user, branch=self.branch,
+            )
+
+        # control: 15:45 NPT on Oct 28
+        mk(datetime(2026, 10, 28, 10, 0, tzinfo=dt_tz.utc), 'outbound', 100, self.admin)
+        # boundary: 20:00 UTC Oct 28 = 01:45 NPT Oct 29, and a 0-second call
+        mk(datetime(2026, 10, 28, 20, 0, tzinfo=dt_tz.utc), 'inbound', 0, self.admin)
+        # no caller recorded
+        mk(datetime(2026, 10, 29, 10, 0, tzinfo=dt_tz.utc), 'outbound', 200, None)
+
+    def test_totals_average_and_connect_rate(self):
+        data = self.client.get('/api/calls/summary/').data
+        self.assertEqual(data['total_calls'], 3)
+        self.assertEqual(data['inbound'], 1)
+        self.assertEqual(data['outbound'], 2)
+        self.assertEqual(data['total_seconds'], 300)
+        self.assertEqual(data['total_formatted'], '00:05:00')
+        self.assertEqual(data['avg_seconds'], 100)
+        self.assertEqual(data['connected_calls'], 2)          # the 0 s call is excluded
+        self.assertAlmostEqual(data['connect_rate'], 0.667, places=3)
+
+    def test_days_are_counted_in_nepal_time(self):
+        by_day = self.client.get('/api/calls/summary/').data['by_day']
+        self.assertEqual(by_day, [
+            {'date': '2026-10-28', 'calls': 1, 'seconds': 100},
+            {'date': '2026-10-29', 'calls': 2, 'seconds': 200},   # includes the 20:00 UTC call
+        ])
+
+    def test_by_user_includes_unknown_caller(self):
+        by_user = self.client.get('/api/calls/summary/').data['by_user']
+        self.assertEqual(by_user[0]['user_id'], self.admin.id)
+        self.assertEqual(by_user[0]['calls'], 2)
+        unknown = [u for u in by_user if u['user_id'] is None]
+        self.assertEqual(len(unknown), 1)
+        self.assertEqual(unknown[0]['name'], 'Unknown')
+
+    def test_empty_result_returns_zeros(self):
+        data = self.client.get('/api/calls/summary/?search=nomatchatall').data
+        self.assertEqual(data['total_calls'], 0)
+        self.assertEqual(data['total_seconds'], 0)
+        self.assertEqual(data['total_formatted'], '00:00:00')
+        self.assertEqual(data['avg_seconds'], 0)
+        self.assertEqual(data['connect_rate'], 0)
+        self.assertEqual(data['by_day'], [])
+        self.assertEqual(data['by_user'], [])
+
+    def test_summary_total_matches_list_count_with_filters(self):
+        for query in ('', '?direction=outbound', '?direction=inbound'):
+            summary = self.client.get(f'/api/calls/summary/{query}').data
+            listing = self.client.get(f'/api/calls/{query}').data
+            self.assertEqual(summary['total_calls'], listing['count'], query)
+
+    def test_summary_query_count_is_constant(self):
+        from datetime import datetime, timezone as dt_tz
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+        from apps.lead.models import LeadCall
+
+        with CaptureQueriesContext(connection) as small:
+            self.client.get('/api/calls/summary/')
+        for i in range(25):
+            LeadCall.objects.create(
+                lead=self.lead, call_timestamp=datetime(2026, 10, 30, 6, i, tzinfo=dt_tz.utc),
+                direction='outbound', caller='x', phone_number='9855555555',
+                duration_seconds=i, created_by=self.admin, branch=self.branch,
+            )
+        with CaptureQueriesContext(connection) as large:
+            self.client.get('/api/calls/summary/')
+        self.assertEqual(len(small), len(large))
+
