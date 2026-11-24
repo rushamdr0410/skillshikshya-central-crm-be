@@ -161,6 +161,57 @@ class GlobalCallListTests(APITestCase):
         rows = list(csv.reader(io.StringIO(raw.decode('utf-8-sig'))))
         return response, raw, rows
 
+    def _make_branch_fixture(self):
+        from apps.branch.models import Branch
+        from apps.lead.models import LeadCall
+        from django.utils import timezone as tz
+        self.dharan = Branch.objects.create(name='Dharan', code='DHR')
+        self.dharan_call = LeadCall.objects.create(
+            lead=self.lead, call_timestamp=tz.now(), direction='outbound',
+            caller='Dharan Caller', phone_number='9844444444',
+            duration_seconds=30, created_by=self.admin, branch=self.dharan,
+        )
+        self.dharan_user = User.objects.create_user(
+            email='dhr@test.com', name='Dharan User', password='x',
+            branch=self.dharan,
+        )
+        self.brt_user = User.objects.create_user(
+            email='brt@test.com', name='Biratnagar User', password='x',
+            branch=self.branch,
+        )
+
+    def test_branch_user_list_only_own_branch(self):
+        self._make_branch_fixture()
+        self.client.force_authenticate(self.dharan_user)
+        ids = [r['id'] for r in self.client.get('/api/calls/').data['results']]
+        self.assertEqual(ids, [self.dharan_call.id])
+        self.client.force_authenticate(self.brt_user)
+        ids = [r['id'] for r in self.client.get('/api/calls/').data['results']]
+        self.assertEqual(sorted(ids), sorted([self.recent_call.id, self.old_call.id]))
+
+    def test_branch_user_summary_only_own_branch(self):
+        self._make_branch_fixture()
+        self.client.force_authenticate(self.dharan_user)
+        self.assertEqual(self.client.get('/api/calls/summary/').data['total_calls'], 1)
+        self.client.force_authenticate(self.brt_user)
+        self.assertEqual(self.client.get('/api/calls/summary/').data['total_calls'], 2)
+
+    def test_branch_user_export_only_own_branch(self):
+        self._make_branch_fixture()
+        self.client.force_authenticate(self.dharan_user)
+        _, _, rows = self._export()
+        self.assertEqual([r[4] for r in rows[1:]], ['9844444444'])
+        self.client.force_authenticate(self.brt_user)
+        _, _, rows = self._export()
+        self.assertNotIn('9844444444', [r[4] for r in rows[1:]])
+        self.assertEqual(len(rows) - 1, 2)
+
+    def test_staff_sees_all_and_can_narrow_by_branch_id(self):
+        self._make_branch_fixture()          # self.client is still the staff admin
+        self.assertEqual(self.client.get('/api/calls/').data['count'], 3)
+        response = self.client.get(f'/api/calls/?branch_id={self.dharan.id}')
+        self.assertEqual([r['id'] for r in response.data['results']], [self.dharan_call.id])
+
     def test_list_returns_all_calls_newest_first(self):
         response = self.client.get('/api/calls/')
         self.assertEqual(response.status_code, 200)
@@ -267,22 +318,6 @@ class GlobalCallListTests(APITestCase):
 
         self.assertEqual(len(small), len(large))
 
-    def test_zz_nonstaff_without_branch_experiment(self):
-        from apps.lead.models import LeadCall
-        from django.utils import timezone as tz
-        LeadCall.objects.create(          # a call with NO branch
-            lead=self.lead, call_timestamp=tz.now(), direction='inbound',
-            caller='NoBranch', phone_number='9866666666', duration_seconds=10,
-            created_by=self.admin, branch=None,
-        )
-        nobranch = User.objects.create_user(email='nb@test.com', name='No Branch', password='x')
-        self.client.force_authenticate(nobranch)
-        print('\nLIST COUNT:', self.client.get('/api/calls/').data['count'])
-        print('SUMMARY TOTAL:', self.client.get('/api/calls/summary/').data['total_calls'])
-        _, _, rows = self._export()
-        print('EXPORT ROWS:', len(rows) - 1)
-        print('TOTAL CALLS IN DB:', LeadCall.objects.count())
-
     def test_list_includes_duration_formatted(self):
         row = self.client.get('/api/calls/').data['results'][0]
         self.assertEqual(row['duration_formatted'], '04:30')  
@@ -371,110 +406,6 @@ class CallDateFilterTests(APITestCase):
         self.assertEqual(response.data['count'], 5)
 
 class GlobalCallSummaryTests(APITestCase):
-    def setUp(self):
-        from datetime import datetime
-        from zoneinfo import ZoneInfo
-        from apps.branch.models import Branch
-        from apps.lead.models import LeadCall
-
-        self.npt = ZoneInfo("Asia/Kathmandu")
-        self.brt = Branch.objects.create(name='Biratnagar', code='BRT')
-        self.dhr = Branch.objects.create(name='Dharan', code='DHR')
-
-        self.admin = User.objects.create_user(
-            email='sadmin@test.com', name='Staff Admin', password='x', is_staff=True,
-        )
-        self.brt_user = User.objects.create_user(
-            email='brt@test.com', name='BRT User', password='x', branch=self.brt,
-        )
-        self.dhr_user = User.objects.create_user(
-            email='dhr@test.com', name='DHR User', password='x', branch=self.dhr,
-        )
-        self.lead = Lead.objects.create(full_name='Sum Person', phone='9800000001')
-
-        def make(ts, direction, dur, user, branch):
-            return LeadCall.objects.create(
-                lead=self.lead, call_timestamp=ts, direction=direction,
-                caller=user.name, phone_number='9800000001',
-                duration_seconds=dur, created_by=user, branch=branch,
-            )
-
-        npt = self.npt
-        # Biratnagar: 3 calls, two on different NPT days around midnight
-        make(datetime(2026, 11, 23, 23, 30, tzinfo=npt), 'outbound', 259, self.brt_user, self.brt)
-        make(datetime(2026, 11, 24, 0, 30, tzinfo=npt), 'inbound', 0, self.brt_user, self.brt)
-        make(datetime(2026, 11, 24, 10, 0, tzinfo=npt), 'outbound', 120, self.brt_user, self.brt)
-        # Dharan: 2 calls
-        make(datetime(2026, 11, 24, 11, 0, tzinfo=npt), 'outbound', 60, self.dhr_user, self.dhr)
-        make(datetime(2026, 11, 24, 12, 0, tzinfo=npt), 'inbound', 30, self.dhr_user, self.dhr)
-
-    def test_totals_match_list_count(self):
-        self.client.force_authenticate(self.admin)
-        qs = '?direction=outbound&date_from=2026-11-23'
-        summary = self.client.get(f'/api/calls/summary/{qs}').data
-        listing = self.client.get(f'/api/calls/{qs}').data
-        self.assertEqual(summary['total_calls'], listing['count'])
-        self.assertEqual(summary['total_calls'], 3)
-
-    def test_day_buckets_use_nepal_time(self):
-        self.client.force_authenticate(self.brt_user)
-        data = self.client.get('/api/calls/summary/').data
-        days = {row['date']: row['count'] for row in data['per_day']}
-        self.assertEqual(days, {'2026-11-23': 1, '2026-11-24': 2})
-
-    def test_empty_result_returns_zeros(self):
-        self.client.force_authenticate(self.admin)
-        data = self.client.get('/api/calls/summary/?search=zzzzzz').data
-        self.assertEqual(data['total_calls'], 0)
-        self.assertEqual(data['inbound'], 0)
-        self.assertEqual(data['outbound'], 0)
-        self.assertEqual(data['talk_seconds'], 0)
-        self.assertEqual(data['avg_seconds'], 0)
-        self.assertEqual(data['connect_rate'], 0)
-        self.assertEqual(data['per_day'], [])
-        self.assertEqual(data['top_callers'], [])
-
-    def test_non_staff_sees_only_own_branch(self):
-        self.client.force_authenticate(self.brt_user)
-        self.assertEqual(self.client.get('/api/calls/summary/').data['total_calls'], 3)
-
-        self.client.force_authenticate(self.dhr_user)
-        self.assertEqual(self.client.get('/api/calls/summary/').data['total_calls'], 2)
-
-        self.client.force_authenticate(self.dhr_user)
-        data = self.client.get(f'/api/calls/summary/?branch_id={self.brt.id}').data
-        self.assertEqual(data['total_calls'], 2)
-
-        self.client.force_authenticate(self.admin)
-        self.assertEqual(self.client.get('/api/calls/summary/').data['total_calls'], 5)
-
-        data = self.client.get(f'/api/calls/summary/?branch_id={self.dhr.id}').data
-        self.assertEqual(data['total_calls'], 2)
-
-    def test_query_count_is_fixed(self):
-        from datetime import datetime
-        from django.db import connection
-        from django.test.utils import CaptureQueriesContext
-        from apps.lead.models import LeadCall
-
-        self.client.force_authenticate(self.admin)
-
-        with CaptureQueriesContext(connection) as before:
-            self.client.get('/api/calls/summary/')
-            baseline = len(before)
-
-            for i in range(20):
-                LeadCall.objects.create(
-                    lead=self.lead,
-                    call_timestamp=datetime(2026, 11, 25, 9, i, tzinfo=self.npt),
-                    direction='outbound', caller='Bulk', phone_number='9800000001',
-                    duration_seconds=30, created_by=self.brt_user, branch=self.brt,
-                )
-
-            with self.assertNumQueries(baseline):
-                response = self.client.get('/api/calls/summary/')
-            self.assertEqual(response.data['total_calls'], 25)
-
 
     def setUp(self):
         from datetime import datetime, timezone as dt_tz
