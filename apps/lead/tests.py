@@ -475,7 +475,7 @@ class GlobalCallSummaryTests(APITestCase):
                 response = self.client.get('/api/calls/summary/')
             self.assertEqual(response.data['total_calls'], 25)
 
-class GlobalCallSummaryTests(APITestCase):
+
     def setUp(self):
         from datetime import datetime, timezone as dt_tz
         from apps.branch.models import Branch
